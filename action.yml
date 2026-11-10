@@ -1,0 +1,18 @@
+name: Keepatch
+description: A weekly maintenance report kept in issues - ranks failing checks, open pull requests and bug reports with fixed rules.
+branding:
+  icon: check-square
+  color: purple
+inputs:
+  token:
+    description: Token used to read pull requests and checks and to write issues.
+    default: ${{ github.token }}
+  dry_run:
+    description: Print the report and what would be written, without writing any issue.
+    default: "false"
+  tinydecide:
+    description: Add TinyDecide scores as a column in the report. They are shown, never used for ranking.
+    default: "true"
+runs:
+  using: node24
+  main: keepatch.mjs

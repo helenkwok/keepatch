@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: read
+      pull-requests: read
+      checks: read
+      statuses: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: node keepatch.mjs --self-test
+      - name: The vendored model is the pinned one
+        run: cd vendor/tinydecide && sha256sum -c SHA256SUMS
+      # The action itself, as another repository would call it, writing nothing.
+      - uses: ./
+        with:
+          dry_run: "true"

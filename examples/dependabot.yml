@@ -1,0 +1,24 @@
+# Copy to .github/dependabot.yml and set the ecosystems the repository uses.
+# Dependabot proposes updates on its own branches; CI checks them; a person merges.
+# Patch and minor updates arrive as one grouped pull request per ecosystem each week, so the
+# review load stays small. Major updates come one at a time.
+version: 2
+updates:
+  - package-ecosystem: cargo # or npm, pip, gomod, ...
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      patch-and-minor:
+        update-types: [patch, minor]
+    # ignore:
+    #   - dependency-name: "some-crate" # anything pinned on purpose and bumped by hand
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
+        update-types: [patch, minor]
