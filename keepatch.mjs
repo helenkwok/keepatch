@@ -4,13 +4,10 @@
 //
 // As a GitHub Action it takes the inputs in action.yml. By hand:
 //   GITHUB_TOKEN=... GITHUB_REPOSITORY=owner/name node keepatch.mjs
-//   KEEPATCH_DRY_RUN=1        print what it would write, write nothing
-//   KEEPATCH_NO_TINYDECIDE=1  leave out the TinyDecide column (shadow scores, never used for ranking)
+//   KEEPATCH_REPOS="owner/a owner/b"  repositories to read (default: GITHUB_REPOSITORY only)
+//   KEEPATCH_DRY_RUN=1                print what it would write, write nothing
 //   node keepatch.mjs --self-test
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
-import { join } from "node:path";
-import { pathToFileURL } from "node:url";
 
 const LABEL = "keepatch";
 const STALE_DAYS = 30;
@@ -37,16 +34,22 @@ export function rank(t) {
   const add = (n, why) => { p += n; reasons.push(why); };
   if (t.kind === "main") add(100, "checks fail on the default branch");
   if (t.kind === "bug") add(40, "open bug report");
+  if (t.kind === "pin") {
+    if (t.diverged) add(15, `pinned commit is not on ${t.branch}; ${t.behind} commits there are not in it`);
+    else add(t.behind >= 100 ? 45 : t.behind >= 20 ? 35 : 25, `${t.behind} commits behind ${t.branch}; pinned commit is from ${t.pinnedDate}`);
+  }
   if (t.kind === "pr") {
     if (t.security) add(90, "mentions a security advisory");
     if (t.checks === "failing") add(t.bot ? 70 : 60, "checks fail");
     if (t.checks === "none") add(55, "no check ran on the current commit");
+    if (t.checks === "running") reasons.push("checks still running");
     if (t.checks === "passing" && !t.draft) add(t.bot ? 50 : 45, "passes checks and waits for a merge");
     if (t.checks === "passing" && !t.reviewedAtHead) reasons.push("no review of the current commit");
+    if (t.bot && t.jump === "breaking") add(15, "breaking by semver: read the changelog before merging");
     if (t.conflict) add(20, "conflicts with the base branch");
     if (t.ageDays >= STALE_DAYS) add(30, `open for ${t.ageDays} days`);
   }
-  if (t.kind !== "main") p += Math.min(t.ageDays, 20) / 2; // older first within a tier, capped
+  if (t.kind === "pr" || t.kind === "bug") p += Math.min(t.ageDays, 20) / 2; // older first within a tier, capped
   return { priority: Math.round(p), reasons };
 }
 
@@ -65,6 +68,33 @@ export const reviewedAt = (head, reviews, comments = []) =>
 // mention security all the time (seen on StochCraft #99).
 export const isSecurity = (title, body = "", labels = []) =>
   SECURITY.test(title) || ADVISORY.test(title) || ADVISORY.test(body) || labels.some((l) => /security/i.test(l));
+
+// What a version bump means under semver, read from an update bot's title ("from 1.2.3 to 2.0.0").
+// "breaking" is a new major version, or a new minor of a 0.x version (breaking under Cargo's rules).
+// On 9,122 Dependabot pull requests this rule alone ranked the ones that later failed or needed a
+// fix well above chance (AUROC 0.69 for Cargo); grouped updates carry no version and return null.
+const BUMP = /from v?(\d+)(?:\.(\d+))?(?:\.(\d+))?\S* to v?(\d+)(?:\.(\d+))?(?:\.(\d+))?/i;
+export function semverJump(title) {
+  const m = BUMP.exec(title);
+  if (!m) return null;
+  const [a0, a1, , b0, b1] = m.slice(1).map((x) => Number(x ?? 0));
+  if (b0 !== a0 || (a0 === 0 && b1 !== a1)) return "breaking";
+  return b1 !== a1 ? "minor" : "patch";
+}
+
+// Git dependencies pinned to a revision in a Cargo manifest: [{ name, git, rev }]. Update bots
+// do not follow these, so nothing says when a pin has fallen behind.
+// Simplified: inline tables on one line (`name = { git = "...", rev = "..." }`), which is how
+// workspaces write them. Use a TOML parser if multi-line dependency tables turn up.
+export function cargoPins(toml) {
+  const out = [];
+  for (const line of toml.split("\n")) {
+    const m = /^\s*([\w-]+)\s*=\s*\{(.*)\}/.exec(line);
+    const git = m && /\bgit\s*=\s*"([^"]+)"/.exec(m[2]), rev = m && /\brev\s*=\s*"([0-9a-f]{7,40})"/.exec(m[2]);
+    if (git && rev) out.push({ name: m[1], git: git[1].replace(/\.git$/, ""), rev: rev[1] });
+  }
+  return out;
+}
 
 // A task gets its own issue only when something has to be done about it.
 export const needsIssue = (t) => t.kind === "main" || (t.kind === "pr" && (t.checks === "failing" || t.checks === "none"));
@@ -97,6 +127,25 @@ function selfTest() {
   assert.equal(isSecurity("Bump tar from 6.2.0 to 6.2.1", "Fixes GHSA-f5x3-32g6-xq36"), true);
   assert.equal(isSecurity("[Security] Bump lodash"), true);
   assert.equal(isSecurity("Bump serde", "", ["dependencies", "security"]), true);
+  assert.equal(semverJump("Bump serde from 1.0.219 to 1.0.228"), "patch");
+  assert.equal(semverJump("Bump tokio from 1.46.0 to 1.47.1"), "minor");
+  assert.equal(semverJump("Bump egui from 0.37.0 to 0.38.0"), "breaking");
+  assert.equal(semverJump("bump actions/checkout from 4 to 5"), "breaking");
+  assert.equal(semverJump("Bump the actions group with 5 updates"), null);
+  assert.ok(pr({ checks: "passing", bot: true, jump: "breaking" }) > pr({ checks: "passing", bot: true, jump: "patch" }));
+  assert.deepEqual(cargoPins(`[workspace.dependencies]
+# a = { git = "https://example.com/x", rev = "0123456789" }
+serde = "1"
+craft-ui = { version = "0.1.0", git = "https://github.com/o/craft-libs", rev = "d836bea31b7d33d83023edc6bab9cd8059232471" }
+egui = { git = "https://github.com/o/egui.git", rev = "6d518fc799" }
+tagged = { git = "https://github.com/o/t", tag = "v1" }`), [
+    { name: "craft-ui", git: "https://github.com/o/craft-libs", rev: "d836bea31b7d33d83023edc6bab9cd8059232471" },
+    { name: "egui", git: "https://github.com/o/egui", rev: "6d518fc799" },
+  ]);
+  const pin = (o) => rank({ kind: "pin", branch: "main", pinnedDate: "2026-01-01", ...o });
+  assert.ok(pin({ behind: 142 }).priority > pin({ behind: 30 }).priority && pin({ behind: 30 }).priority > pin({ behind: 3 }).priority);
+  assert.ok(pin({ behind: 3 }).priority > pin({ behind: 400, diverged: true }).priority);
+  assert.equal(needsIssue({ kind: "pin" }), false);
   const bot = (body) => [{ user: { login: "coderabbitai[bot]" }, body }];
   assert.equal(reviewedAt("abc", [{ commit_id: "abc", state: "COMMENTED" }]), true);
   assert.equal(reviewedAt("abc", [{ commit_id: "old", state: "APPROVED" }]), false);
@@ -116,96 +165,121 @@ function selfTest() {
 
 // An action's inputs arrive as INPUT_<NAME>; the plain variables are for running it by hand.
 const input = (name) => process.env[`INPUT_${name}`];
-const repo = process.env.GITHUB_REPOSITORY;
+// The host repository runs the workflow and holds the report and task issues. REPOS are read.
+const HOST = process.env.GITHUB_REPOSITORY;
+const REPOS = [...new Set((input("REPOS") || process.env.KEEPATCH_REPOS || HOST || "").split(/[\s,]+/).filter(Boolean))];
 const TOKEN = input("TOKEN") || process.env.GITHUB_TOKEN;
 const DRY = input("DRY_RUN") === "true" || !!process.env.KEEPATCH_DRY_RUN;
-// The model ships with Keepatch (vendor/tinydecide), so a run downloads nothing.
-const TD_DIR = input("TINYDECIDE") === "false" || process.env.KEEPATCH_NO_TINYDECIDE ? null : join(import.meta.dirname, "vendor", "tinydecide");
-async function gh(method, path, body) {
-  const res = await fetch(`https://api.github.com/repos/${repo}${path}`, {
+
+async function api(method, path, body, accept = "application/vnd.github+json") {
+  const res = await fetch(`https://api.github.com${path}`, {
     method,
-    headers: { authorization: `Bearer ${TOKEN}`, accept: "application/vnd.github+json", "x-github-api-version": "2022-11-28", "user-agent": "keepatch" },
+    headers: { authorization: `Bearer ${TOKEN}`, accept, "x-github-api-version": "2022-11-28", "user-agent": "keepatch" },
     body: body ? JSON.stringify(body) : undefined,
   });
   if (!res.ok) throw new Error(`${method} ${path}: ${res.status} ${(await res.text()).slice(0, 200)}`);
-  return res.status === 204 ? null : res.json();
+  return res.status === 204 ? null : accept.endsWith("raw") ? res.text() : res.json();
 }
-// False once a list may have been cut short or a pull request could not be read. A run that did
-// not see everything must not conclude that a problem is gone, so it closes no task issue.
+// False once a list may have been cut short or something could not be read. A run that did not
+// see everything must not conclude that a problem is gone, so it closes no task issue.
 let complete = true;
 // Simplified: first 100 of each list, no paging. Add paging when a repo has more open items.
 async function list(path) {
-  const r = await gh("GET", path + (path.includes("?") ? "&" : "?") + "per_page=100");
+  const r = await api("GET", path + (path.includes("?") ? "&" : "?") + "per_page=100");
   if ((Array.isArray(r) ? r : r.check_runs ?? []).length >= 100) complete = false;
   return r;
 }
 async function write(what, method, path, body) {
   console.log(`${DRY ? "would" : "did"}: ${what}`);
-  return DRY ? null : gh(method, path, body);
+  return DRY ? null : api(method, `/repos/${HOST}${path}`, body);
 }
 const days = (iso, now) => Math.floor((now - Date.parse(iso)) / 864e5);
-async function checksAt(sha) {
-  const [runs, st] = await Promise.all([list(`/commits/${sha}/check-runs`), gh("GET", `/commits/${sha}/status`)]);
-  return { state: checkState(runs.check_runs, st.statuses), failing: runs.check_runs.filter((r) => r.conclusion === "failure").map((r) => r.name) };
+async function checksAt(r, sha) {
+  const [runs, st] = await Promise.all([list(`${r}/commits/${sha}/check-runs`), api("GET", `${r}/commits/${sha}/status`)]);
+  return { state: checkState(runs.check_runs, st.statuses), failing: runs.check_runs.filter((c) => c.conclusion === "failure").map((c) => c.name) };
 }
 
-async function collect(now) {
-  const info = await gh("GET", "");
+// Pinned git dependencies that have fallen behind their upstream's default branch.
+async function pinTasks(repo, branch) {
+  const tree = await api("GET", `/repos/${repo}/git/trees/${branch}?recursive=1`);
+  const manifests = tree.tree.filter((e) => e.type === "blob" && /(^|\/)Cargo\.toml$/.test(e.path)).slice(0, 40);
+  const pins = new Map(); // one entry per upstream and revision, however many crates use it
+  for (const f of manifests) {
+    const toml = await api("GET", `/repos/${repo}/contents/${f.path.split("/").map(encodeURIComponent).join("/")}?ref=${branch}`, null, "application/vnd.github.raw");
+    for (const p of cargoPins(toml)) {
+      const k = `${p.git}@${p.rev}`;
+      pins.set(k, { ...p, names: (pins.get(k)?.names ?? new Set()).add(p.name) });
+    }
+  }
   const tasks = [];
-  const main = await checksAt(info.default_branch);
-  if (main.state === "failing") tasks.push({ kind: "main", key: "main-ci", title: `Checks fail on ${info.default_branch}`, url: `${info.html_url}/actions`, checks: "failing", failing: main.failing, ageDays: 0 });
-  for (const pr of await list("/pulls?state=open")) {
+  for (const p of pins.values()) {
+    const up = /^https:\/\/github\.com\/([\w.-]+\/[\w.-]+)$/.exec(p.git)?.[1];
+    if (!up) { console.log(`pin not compared (not a GitHub URL): ${p.git}`); continue; }
     try {
-      const [c, reviews, comments] = await Promise.all([checksAt(pr.head.sha), list(`/pulls/${pr.number}/reviews`), list(`/issues/${pr.number}/comments`)]);
+      const upstream = await api("GET", `/repos/${up}`);
+      const cmp = await api("GET", `/repos/${up}/compare/${p.rev}...${upstream.default_branch}`);
+      if (!cmp.ahead_by) continue; // the pin is the newest commit
+      const names = [...p.names];
+      tasks.push({
+        kind: "pin", key: `pin-${up}-${p.rev.slice(0, 7)}`.replace(/[^\w-]/g, "-"), url: `https://github.com/${up}/compare/${p.rev}...${upstream.default_branch}`,
+        title: `${up} pinned at ${p.rev.slice(0, 10)} (${names.slice(0, 3).join(", ")}${names.length > 3 ? ` and ${names.length - 3} more` : ""})`,
+        behind: cmp.ahead_by, diverged: cmp.status === "diverged", branch: upstream.default_branch,
+        pinnedDate: cmp.base_commit?.commit?.committer?.date?.slice(0, 10) ?? "an unknown date", ageDays: 0,
+      });
+    } catch (e) {
+      console.log(`pin not compared: ${up} (${e.message})`);
+    }
+  }
+  return tasks;
+}
+
+async function collect(repo, now) {
+  const r = `/repos/${repo}`;
+  const info = await api("GET", r);
+  const tasks = [];
+  const main = await checksAt(r, info.default_branch);
+  if (main.state === "failing") tasks.push({ kind: "main", key: "main-ci", title: `Checks fail on ${info.default_branch}`, url: `${info.html_url}/actions`, checks: "failing", failing: main.failing, ageDays: 0 });
+  for (const pr of await list(`${r}/pulls?state=open`)) {
+    try {
+      const [c, reviews, comments] = await Promise.all([checksAt(r, pr.head.sha), list(`${r}/pulls/${pr.number}/reviews`), list(`${r}/issues/${pr.number}/comments`)]);
       // `mergeable` is only on the single-PR endpoint, and is null while GitHub works it out.
-      const full = await gh("GET", `/pulls/${pr.number}`);
+      const full = await api("GET", `${r}/pulls/${pr.number}`);
       tasks.push({
         kind: "pr", key: `pr-${pr.number}`, title: pr.title, url: pr.html_url, head: pr.head.sha, checks: c.state, failing: c.failing,
-        bot: BOTS.has(pr.user.login), draft: pr.draft, conflict: full.mergeable === false,
+        bot: BOTS.has(pr.user.login), draft: pr.draft, conflict: full.mergeable === false, jump: semverJump(pr.title),
         security: isSecurity(pr.title, pr.body || "", pr.labels.map((l) => l.name)),
         reviewedAtHead: reviewedAt(pr.head.sha, reviews, comments),
         ageDays: days(pr.created_at, now),
       });
     } catch (e) {
       // One unreadable pull request must not stop the report for the rest.
-      console.log(`skipped pr-${pr.number}: ${e.message}`);
+      console.log(`skipped ${repo} pr-${pr.number}: ${e.message}`);
       complete = false;
     }
   }
-  for (const i of await list("/issues?state=open&labels=bug")) {
+  for (const i of await list(`${r}/issues?state=open&labels=bug`)) {
     if (!i.pull_request && !i.labels.some((l) => l.name === LABEL)) tasks.push({ kind: "bug", key: `bug-${i.number}`, title: i.title, url: i.html_url, ageDays: days(i.created_at, now) });
   }
-  return { info, mainState: main.state, complete, tasks:tasks.map((t) => ({ ...t, ...rank(t) })).sort((a, b) => b.priority - a.priority) };
-}
-
-// ---- TinyDecide, shadow only --------------------------------------------------------------
-
-async function shadow(tasks) {
-  const dir = TD_DIR;
-  if (!dir) return null;
   try {
-    const { TinyDecide } = await import(pathToFileURL(join(dir, "tinydecide.js")));
-    const bin = readFileSync(join(dir, "model.bin"));
-    const model = new TinyDecide(JSON.parse(readFileSync(join(dir, "meta.json"), "utf8")), bin.buffer.slice(bin.byteOffset, bin.byteOffset + bin.byteLength));
-    const qs = [{ type: "noul", text: "This describes something that is broken." }, { type: "noul", text: "This change fixes a security vulnerability." }];
-    return new Map(tasks.map((t) => [t.key, model.answer({ state: t.title, questions: qs }).answers.map((a) => a.p.toFixed(2)).join(" / ")]));
+    tasks.push(...await pinTasks(repo, info.default_branch));
   } catch (e) {
-    console.log(`TinyDecide not loaded (${e.message}); report continues without it`);
-    return null;
+    console.log(`pins not read for ${repo}: ${e.message}`);
   }
+  return { state: `checks ${main.state}`, tasks: tasks.map((t) => ({ ...t, repo, ...rank(t) })) };
 }
 
 // ---- report and task issues ---------------------------------------------------------------
 
-function reportBody({ info, mainState, tasks, complete }, td, now, stateJson) {
-  const rows = tasks.map((t) => `| ${t.priority} | [${t.key}](${t.url}) | ${safe(t.title)} | ${t.checks ?? ""} | ${t.reasons.join("; ")} |${td ? ` ${td.get(t.key) ?? ""} |` : ""}`);
+function reportBody(states, tasks, now, stateJson) {
+  const many = REPOS.length > 1;
+  const rows = tasks.map((t) => `| ${t.priority} |${many ? ` ${t.repo.split("/")[1]} |` : ""} [${t.key.replace(/^pin-.*/, "pin")}](${t.url}) | ${safe(t.title)} | ${t.checks ?? ""} | ${t.reasons.join("; ")} |`);
   return [
     marker("report"), `<!-- keepatch:state ${stateJson} -->`,
     `Updated ${new Date(now).toISOString().slice(0, 16)}Z by the scheduled Keepatch run. This issue is rewritten on every run.`,
-    "", `**${info.default_branch}:** checks ${mainState}. **Queue:** ${tasks.length} item${tasks.length === 1 ? "" : "s"}.`,
-    complete ? "" : "\n**This run could not read everything** (a list reached 100 items, or a pull request could not be read; see the run's log). The queue may be missing items, and no task issue was closed.", "",
-    tasks.length ? `| Priority | Item | Title | Checks | Why |${td ? " TinyDecide: broken / security (shadow, not used) |" : ""}\n|---|---|---|---|---|${td ? "---|" : ""}\n${rows.join("\n")}` : "Nothing is waiting.",
-    "", "Priority comes from fixed rules (`rank()` in Keepatch's `keepatch.mjs`). A passing check here means at least one check ran and succeeded on the current commit. Keepatch reports; people merge.",
+    "", ...states.map(([repo, st]) => `- **${repo}:** ${st}`), "", `**Queue:** ${tasks.length} item${tasks.length === 1 ? "" : "s"}.`,
+    complete ? "" : "\n**This run could not read everything** (a list reached 100 items, or something could not be read; see the run's log). The queue may be missing items, and no task issue was closed.", "",
+    tasks.length ? `| Priority |${many ? " Repo |" : ""} Item | Title | Checks | Why |\n|---|${many ? "---|" : ""}---|---|---|---|\n${rows.join("\n")}` : "Nothing is waiting.",
+    "", "Priority comes from fixed rules (`rank()` in Keepatch's `keepatch.mjs`). A passing check here means at least one check ran and succeeded on the current commit. A pin is a git dependency fixed to one commit, which update bots do not follow. Keepatch reports; people merge.",
   ].join("\n");
 }
 
@@ -220,11 +294,22 @@ function taskBody(t, st) {
 }
 
 async function main() {
-  if (!repo || !TOKEN) throw new Error("set GITHUB_REPOSITORY and GITHUB_TOKEN");
+  if (!HOST || !TOKEN) throw new Error("set GITHUB_REPOSITORY and GITHUB_TOKEN");
   const now = Date.now(), today = new Date(now).toISOString().slice(0, 10);
-  const data = await collect(now);
-  const td = await shadow(data.tasks);
-  const mine = (await list(`/issues?state=open&labels=${LABEL}`)).filter((i) => !i.pull_request && keyOf(i.body));
+  const states = [], tasks = [];
+  for (const repo of REPOS) {
+    try {
+      const d = await collect(repo, now);
+      states.push([repo, d.state]); tasks.push(...d.tasks);
+    } catch (e) {
+      // One unreadable repository must not stop the report for the rest.
+      console.log(`skipped ${repo}: ${e.message}`);
+      states.push([repo, "could not be read"]); complete = false;
+    }
+  }
+  tasks.sort((a, b) => b.priority - a.priority);
+
+  const mine = (await list(`/repos/${HOST}/issues?state=open&labels=${LABEL}`)).filter((i) => !i.pull_request && keyOf(i.body));
   // One issue per key: the oldest keeps the key, and any other issue carrying the same marker
   // (an overlapping run, or a copied marker) is closed so it cannot sit there unowned.
   const byKey = new Map();
@@ -233,10 +318,13 @@ async function main() {
     if (!first) byKey.set(key, i);
     else await write(`close issue #${i.number} (same key ${key} as #${first.number})`, "PATCH", `/issues/${i.number}`, { state: "closed", state_reason: "not_planned" });
   }
-  if (!DRY) await gh("POST", "/labels", { name: LABEL, color: "5319e7", description: "Opened and updated by the Keepatch maintenance run" }).catch(() => {}); // exists already: fine
+  if (!DRY) await api("POST", `/repos/${HOST}/labels`, { name: LABEL, color: "5319e7", description: "Opened and updated by the Keepatch maintenance run" }).catch(() => {}); // exists already: fine
 
+  // Task issues are kept only for the host repository: the workflow's token cannot write to the
+  // others, and they did not ask for issues. Their items appear in the report.
+  const hostRead = states.some(([repo, st]) => repo === HOST && st !== "could not be read");
   const active = new Set();
-  for (const t of data.tasks.filter(needsIssue)) {
+  for (const t of tasks.filter((t) => t.repo === HOST && needsIssue(t))) {
     active.add(t.key);
     const old = byKey.get(t.key), prev = readState(old?.body);
     const st = { head: t.head ?? null, checks: t.checks, first: prev?.first ?? today, runs: (prev?.runs ?? 0) + 1 };
@@ -244,15 +332,16 @@ async function main() {
     if (old) await write(`update issue #${old.number} (${t.key}, run ${st.runs})`, "PATCH", `/issues/${old.number}`, { title, body: taskBody(t, st) });
     else await write(`open issue for ${t.key}`, "POST", "/issues", { title, body: taskBody(t, st), labels: [LABEL] });
   }
-  if (!data.complete) console.log("this run could not read everything: closing no task issue");
+  const mayClose = complete && hostRead;
+  if (!mayClose) console.log("this run did not read everything in the host repository: closing no task issue");
   for (const [key, issue] of byKey) {
-    if (!data.complete || key === "report" || active.has(key)) continue;
+    if (!mayClose || key === "report" || active.has(key)) continue;
     await write(`close issue #${issue.number} (${key} no longer needs work)`, "POST", `/issues/${issue.number}/comments`, { body: "The problem is gone on the latest run. Closing." });
-    if (!DRY) await gh("PATCH", `/issues/${issue.number}`, { state: "closed", state_reason: "completed" });
+    if (!DRY) await api("PATCH", `/repos/${HOST}/issues/${issue.number}`, { state: "closed", state_reason: "completed" });
   }
 
   const prevRuns = readState(byKey.get("report")?.body)?.runs ?? 0;
-  const body = reportBody(data, td, now, JSON.stringify({ runs: prevRuns + 1, last: today }));
+  const body = reportBody(states, tasks, now, JSON.stringify({ runs: prevRuns + 1, last: today }));
   const report = byKey.get("report");
   if (report) await write(`rewrite report issue #${report.number}`, "PATCH", `/issues/${report.number}`, { body });
   else await write("open the report issue", "POST", "/issues", { title: "Keepatch maintenance report", body, labels: [LABEL] });

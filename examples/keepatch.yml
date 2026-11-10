@@ -38,3 +38,8 @@ jobs:
       - uses: helenkwok/keepatch@COMMIT_SHA
         with:
           dry_run: ${{ inputs.dry_run || 'false' }}
+          # To read several repositories into one report, list them (public ones need no extra
+          # token). The report and task issues are written in this repository.
+          # repos: |
+          #   owner/this-repo
+          #   owner/another-repo
